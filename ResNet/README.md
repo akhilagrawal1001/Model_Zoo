@@ -1,6 +1,7 @@
 # ResNet34
 
 This is an implementation of `ResNet34` using tensorflow on `CIFAR10` dataset.
+
 `ResNet.ipynb` has the model trained _without_ data augmentation whereas `ResNet34.ipynb` is trained _with_ data augmentation.
 
 Some of the links used to learn and read about ResNet are:
