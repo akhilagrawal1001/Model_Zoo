@@ -2,51 +2,63 @@ import os
 import cv2
 import xml.etree.ElementTree as ET
 import numpy as np
-import bbox_util
+from utils.bbox_util import centre_to_corner
 from iou import iou
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras.layers import Conv2D, Reshape
+from Default_box_layers import DefBoxes
 
-def read_sample(image_path, label_path):
-    """ Read image and label file in xml format.
-    Args:
-        - image_path: path to image file
-        - label_path: path to label xml file
-    Returns:
-        - image: a numpy array with a data type of float
-        - bboxes: a numpy array with a data type of float
-        - classes: a list of strings
-    Raises:
-        - Image file does not exist
-        - Label file does not exist
-    """
-    image_path = image_path.strip("\n")
-    label_path = label_path.strip("\n")
-    assert os.path.exists(image_path), "Image file does not exist."
-    assert os.path.exists(label_path), "Label file does not exist."
+num_class = 21
+variance = [0.1, 0.1, 0.2, 0.2]
+aspect_ratio_4 = [1.0, 2.0, 0.5]
+aspect_ratio_6 = [1.0, 2.0, 0.5, 3.0, 0.33]
 
-    image = cv2.imread(image_path)  # read image in bgr format
-    bboxes, classes = [], []
-    xml_root = ET.parse(label_path).getroot()
-    objects = xml_root.findall("object")
-    for i, obj in enumerate(objects):
-        name = obj.find("name").text
-        bndbox = obj.find("bndbox")
-        # the reason why we use float() is because some value in bndbox are float
-        xmin = float(bndbox.find("xmin").text)
-        ymin = float(bndbox.find("ymin").text)
-        xmax = float(bndbox.find("xmax").text)
-        ymax = float(bndbox.find("ymax").text)
-        bboxes.append([xmin, ymin, xmax, ymax])
-        classes.append(name)
-    return np.array(image, dtype=np.float), np.array(bboxes, dtype=np.float), classes
+# The below 2 are custom functions, used in model architecture
+'''
+It takes the output of a feature map and returns three layers.
+First layer : Confidence scores for different classes.
+Second layer : Bounding Box Parameters for predictions.
+Third layer : Default Boxes layer corresponding to the feature map.
+'''
+def get_pred_4(input, scale1, next_scale1):
+  
+    conf_4 = Conv2D(4 * num_class, (3,3), padding='same')(input)
+    loc_4 = Conv2D(4 * 4, (3,3), padding='same')(input)
+    def_box_4 = DefBoxes((300, 300, 3), scale1, next_scale1, aspect_ratio_4, variance)(input)
 
+    conf_4 = Reshape((-1, num_class))(conf_4)
+    loc_4 = Reshape((-1, 4))(loc_4)
+    def_box_4 = Reshape((-1, 8))(def_box_4)
+
+    return conf_4, loc_4, def_box_4
+
+def get_pred_6(input, scale1, next_scale1):
+  
+    conf_6 = Conv2D(6 * num_class, (3,3), padding='same')(input)
+    loc_6 = Conv2D(6 * 4, (3,3), padding='same')(input)
+    def_box_6 = DefBoxes((300, 300, 3), scale1, next_scale1, aspect_ratio_6, variance)(input)
+
+    conf_6 = Reshape((-1, num_class))(conf_6)
+    loc_6 = Reshape((-1, 4))(loc_6)
+    def_box_6 = Reshape((-1, 8))(def_box_6)
+
+    return conf_6, loc_6, def_box_6
+
+# Generates a label vector with value 1 corresponding to given class
 def one_hot_class_label(classname, label_maps):
     temp = np.zeros((len(label_maps)), dtype=np.int)
     temp[label_maps.index(classname)] = 1
     return temp
 
+'''
+As in SSD training, not all default boxes will correspond to an object.
+Hence we need to match default boxes with ground truth boxes ( here done by Jaccard overlap ).
+This function does the purpose and returns matched boxes.
+'''
 def match_gt_boxes_to_default_boxes(gt_boxes, default_boxes, match_threshold=0.5, neutral_threshold=0.3):
-    gt_boxes = bbox_util.centre_to_corner(gt_boxes)
-    default_boxes = bbox_util.centre_to_corner(default_boxes)
+    gt_boxes = centre_to_corner(gt_boxes)
+    default_boxes = centre_to_corner(default_boxes)
 
     num_gt = gt_boxes.shape[0]
     num_def = default_boxes.shape[0]
@@ -83,7 +95,7 @@ def match_gt_boxes_to_default_boxes(gt_boxes, default_boxes, match_threshold=0.5
     # find neutral boxes (ious that are higher than neutral_threshold but below threshold)
     # these boxes are neither background nor has enough ious score to qualify as a match.
     background_gt_boxes_idxs = np.argmax(ious, axis=0)
-    background_gt_boxes_ious = ious[background_gt_boxes_idxs, list(range(num_default_boxes))]
+    background_gt_boxes_ious = ious[background_gt_boxes_idxs, list(range(num_def))]
     neutral_df_boxes_idxs = np.nonzero(background_gt_boxes_ious >= neutral_threshold)[0]
     neutral_gt_boxes_idxs = background_gt_boxes_idxs[neutral_df_boxes_idxs]
     neutral_boxes = np.concatenate([
@@ -92,19 +104,3 @@ def match_gt_boxes_to_default_boxes(gt_boxes, default_boxes, match_threshold=0.5
     ], axis=-1)
 
     return matches, neutral_boxes
-
-
-def encode_bboxes(y, epsilon=10e-5):
-   
-    gt_boxes = y[:, -12:-8]
-    df_boxes = y[:, -8:-4]
-    variances = y[:, -4:]
-    encoded_gt_boxes_cx = ((gt_boxes[:, 0] - df_boxes[:, 0]) / (df_boxes[:, 2])) / np.sqrt(variances[:, 0])
-    encoded_gt_boxes_cy = ((gt_boxes[:, 1] - df_boxes[:, 1]) / (df_boxes[:, 3])) / np.sqrt(variances[:, 1])
-    encoded_gt_boxes_w = np.log(epsilon + gt_boxes[:, 2] / df_boxes[:, 2]) / np.sqrt(variances[:, 2])
-    encoded_gt_boxes_h = np.log(epsilon + gt_boxes[:, 3] / df_boxes[:, 3]) / np.sqrt(variances[:, 3])
-    y[:, -12] = encoded_gt_boxes_cx
-    y[:, -11] = encoded_gt_boxes_cy
-    y[:, -10] = encoded_gt_boxes_w
-    y[:, -9] = encoded_gt_boxes_h
-    return y
